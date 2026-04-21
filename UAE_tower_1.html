@@ -1,0 +1,352 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>UAE Towers Map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+<style>
+  body { margin:0; font-family: Arial, sans-serif; }
+  #map { height: 100vh; width: 100vw; }
+  #timestamp-display {
+    position: absolute; top: 10px; left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0,0,0,0.7); color: #fff;
+    padding: 6px 12px; border-radius: 6px; font-size: 14px; z-index: 1000;
+  }
+  #controls {
+    position: absolute; bottom: 12px; left: 50%;
+    transform: translateX(-50%);
+    background: rgba(255,255,255,0.95);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+    border-radius: 10px; padding: 8px 12px; z-index: 1001;
+    display: flex; align-items: center; gap: 10px; min-width: 320px;
+  }
+  #playPause {
+    border: none; border-radius: 999px; width: 36px; height: 36px;
+    display: grid; place-items: center; cursor: pointer;
+    background: #0d6efd; color: white; font-size: 16px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+  }
+  #scrubber { width: 300px; cursor:pointer; }
+  #currentTime { min-width: 150px; text-align: center; font-weight: 600; }
+  #rightControls {
+    position: absolute; right: 12px; bottom: 12px; z-index: 1001;
+    background: rgba(255,255,255,0.95); border-radius: 10px; padding: 8px 10px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2); display: flex; align-items: center; gap: 8px;
+    font-size: 14px;
+  }
+  #dropArea {
+    position:absolute; top:0; left:0; width:100%; height:100%;
+    background: rgba(0,0,0,0.05); display:flex; justify-content:center; align-items:center;
+    z-index:2000; font-size:22px; color:#555; pointer-events:auto;
+    text-align:center; padding:20px;
+  }
+  #loadingOverlay {
+    position:absolute; top:0; left:0; width:100%; height:100%;
+    background: rgba(255,255,255,0.96);
+    display:flex; flex-direction:column; justify-content:center; align-items:center;
+    gap:14px; z-index:2001; color:#333; font-size:16px;
+  }
+  #loadingOverlay .spinner {
+    width:42px; height:42px; border:4px solid #e5e5e5; border-top-color:#0d6efd;
+    border-radius:50%; animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hidden { display:none !important; }
+</style>
+</head>
+<body>
+<div id="timestamp-display">Loading…</div>
+<div id="map"></div>
+<div id="controls" style="display:none;">
+  <button id="playPause" title="Play/Pause">⏸</button>
+  <input id="scrubber" type="range" min="0" max="0" step="1" value="0">
+  <div id="currentTime">—</div>
+</div>
+<div id="rightControls" style="display:none;">
+  <label><input id="redOnly" type="checkbox"> Show only red</label>
+</div>
+
+<div id="loadingOverlay">
+  <div class="spinner"></div>
+  <div id="loadingText">Loading <b>towers 2.csv</b>…</div>
+  <div style="font-size:12px; color:#888;">Large files may take several seconds.</div>
+</div>
+
+<div id="dropArea" class="hidden">Drag &amp; Drop CSV File Here</div>
+
+<script>
+const INTERVAL_MS = 2000;
+const RED_THRESHOLD = 100;
+const ICON_SIZE = 50;
+const CENTER_SIZE = 16;
+const RING_RADIUS = 40;
+const CSV_FILENAME = 'towers 2.csv';
+
+const map = L.map('map').setView([24.5, 54.5], 7);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© OpenStreetMap'
+}).addTo(map);
+
+const clusterGroup = L.markerClusterGroup({
+  showCoverageOnHover: false,
+  spiderfyOnEveryZoom: false,
+  spiderfyOnMaxZoom: true,
+  maxClusterRadius: 60
+});
+map.addLayer(clusterGroup);
+
+let allData = [], uniqueTimestamps = [], idxByTimestamp = new Map(), markersByLocation = new Map();
+let isPlaying = true, timer = null, currentIndex = 0, redOnly = false;
+
+// ---------- Auto-load "tower 2.csv" from the same folder ----------
+window.addEventListener('DOMContentLoaded', tryAutoLoad);
+
+async function tryAutoLoad(){
+  const url = './' + encodeURIComponent(CSV_FILENAME);
+  setLoadingText('Downloading <b>' + CSV_FILENAME + '</b>…');
+
+  let text;
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status + ' ' + resp.statusText);
+
+    const total = Number(resp.headers.get('content-length')) || 0;
+    if (resp.body && resp.body.getReader && total){
+      // Stream with live progress for big files
+      const reader = resp.body.getReader();
+      const chunks = [];
+      let received = 0;
+      while (true){
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        const pct     = Math.round((received/total)*100);
+        const mb      = (received/1048576).toFixed(1);
+        const totalMb = (total/1048576).toFixed(1);
+        setLoadingText(`Downloading <b>${CSV_FILENAME}</b> — ${mb} / ${totalMb} MB (${pct}%)`);
+      }
+      text = await new Blob(chunks).text();
+    } else {
+      text = await resp.text();
+    }
+  } catch (err) {
+    console.warn('Auto-load failed:', err);
+    showDropFallback(
+      'Could not load <b>' + CSV_FILENAME + '</b> from this folder.<br>' +
+      'Error: ' + err.message + '<br>' +
+      'Make sure the server is running and the file exists — or drop a CSV here.'
+    );
+    return;
+  }
+
+  setLoadingText('Parsing ' + (text.length/1048576).toFixed(1) + ' MB…');
+  // Yield a frame so the loading text paints before the heavy work
+  setTimeout(() => {
+    Papa.parse(text, {
+      header: true,
+      dynamicTyping: true,
+      worker: true,            // parse off-thread so UI stays responsive
+      skipEmptyLines: true,
+      complete: (results) => {
+        const rows = (results.data || []).filter(d => Number(d.Latitude) && Number(d.Longitude));
+        if (!rows.length){
+          showDropFallback('No valid rows found in <b>' + CSV_FILENAME + '</b>.<br>Drop a CSV to continue.');
+          return;
+        }
+        setLoadingText('Rendering ' + rows.length.toLocaleString() + ' rows…');
+        setTimeout(() => processData(rows), 0);
+      },
+      error: (err) => {
+        console.error('Parse error:', err);
+        showDropFallback('Error parsing CSV: ' + (err.message || err));
+      }
+    });
+  }, 30);
+}
+
+function setLoadingText(html){
+  const el = document.getElementById('loadingText');
+  if (el) el.innerHTML = html;
+}
+function hideLoading(){
+  document.getElementById('loadingOverlay').classList.add('hidden');
+}
+function showDropFallback(msgHtml){
+  hideLoading();
+  const drop = document.getElementById('dropArea');
+  drop.innerHTML = msgHtml || 'Drag &amp; Drop CSV File Here';
+  drop.classList.remove('hidden');
+}
+
+// ---------- Drag-drop path: parse text, then hand off to processData ----------
+function handleCSV(csvText){
+  const rows = Papa.parse(csvText, {header:true, dynamicTyping:true, skipEmptyLines:true}).data
+    .filter(d => Number(d.Latitude) && Number(d.Longitude));
+  processData(rows);
+}
+
+// ---------- Shared post-parse pipeline ----------
+function processData(rows){
+  allData = rows;
+
+  // Sort timestamps as real dates. String sort mis-orders "8/1/2025 2:00" after "19:00".
+  uniqueTimestamps = Array.from(new Set(allData.map(d => d.Timestamp)))
+    .sort((a, b) => new Date(a) - new Date(b));
+
+  idxByTimestamp = new Map();
+  uniqueTimestamps.forEach(ts => idxByTimestamp.set(ts, new Map()));
+  for (const d of allData){
+    const ts = d.Timestamp;
+    const key = `${d.Latitude},${d.Longitude}`;
+    const mapForTs = idxByTimestamp.get(ts);
+    if (!mapForTs.has(key)) mapForTs.set(key, []);
+    mapForTs.get(key).push(d);
+  }
+
+  const locations = new Set(allData.map(d => `${d.Latitude},${d.Longitude}`));
+  locations.forEach(locKey => {
+    const [lat, lon] = locKey.split(',').map(Number);
+    const m = L.marker([lat, lon], {locKey});
+    markersByLocation.set(locKey, m);
+    clusterGroup.addLayer(m);
+  });
+
+  hideLoading();
+  document.getElementById('dropArea').classList.add('hidden');
+  setupControls();
+  renderFrame(0);
+  startTimer();
+}
+
+function setupControls(){
+  const controls = document.getElementById('controls');
+  const rightControls = document.getElementById('rightControls');
+  const scrubber = document.getElementById('scrubber');
+  const playPause = document.getElementById('playPause');
+  const redOnlyChk = document.getElementById('redOnly');
+
+  controls.style.display = 'flex';
+  rightControls.style.display = 'flex';
+
+  scrubber.max = Math.max(0, uniqueTimestamps.length - 1);
+  scrubber.value = 0;
+
+  playPause.addEventListener('click', () => {
+    if (isPlaying){ stopTimer(); playPause.textContent = '▶'; }
+    else { startTimer(); playPause.textContent = '⏸'; }
+  });
+
+  scrubber.addEventListener('input', (e) => {
+    currentIndex = Number(e.target.value);
+    renderFrame(currentIndex);
+  });
+
+  redOnlyChk.addEventListener('change', (e) => {
+    redOnly = e.target.checked;
+    renderFrame(currentIndex, true);
+  });
+}
+
+function startTimer(){
+  isPlaying = true;
+  clearInterval(timer);
+  timer = setInterval(() => {
+    currentIndex = (currentIndex + 1) % uniqueTimestamps.length;
+    document.getElementById('scrubber').value = currentIndex;
+    renderFrame(currentIndex);
+  }, INTERVAL_MS);
+}
+
+function stopTimer(){
+  isPlaying = false;
+  clearInterval(timer);
+}
+
+function renderFrame(index, forceRecluster=false){
+  if (!uniqueTimestamps.length) return;
+  const ts = uniqueTimestamps[index];
+  const perLoc = idxByTimestamp.get(ts) || new Map();
+  document.getElementById('timestamp-display').textContent = ts ?? '';
+  document.getElementById('currentTime').textContent = ts ?? '';
+  const shouldBeInCluster = new Set();
+
+  markersByLocation.forEach((marker, locKey) => {
+    const details = perLoc.get(locKey) || null;
+    if (!details){
+      marker.setOpacity(0);
+      marker._isRed = false;
+      if (redOnly && clusterGroup.hasLayer(marker)) clusterGroup.removeLayer(marker);
+      return;
+    }
+    const cellCounts = details.map(d => Number(d.Cell_Count) || 0);
+    const total = cellCounts.reduce((a,b) => a + b, 0);
+    const isRed = total > RED_THRESHOLD;
+    marker._isRed = isRed;
+
+    const labels = cellCounts.map((count, i) => {
+      const angle = (i / cellCounts.length) * 2 * Math.PI;
+      const x = Math.cos(angle) * RING_RADIUS;
+      const y = Math.sin(angle) * RING_RADIUS;
+      return `<div style="position:absolute; left:${50+x}%; top:${50+y}%; transform:translate(-50%,-50%); font-size:10px; font-weight:bold; color:#000; background:#fff; padding:1px 3px; border-radius:3px; box-shadow:0 1px 2px rgba(0,0,0,0.3);">${count}</div>`;
+    }).join("");
+
+    const centerColor = isRed ? 'rgba(220,53,69,0.95)' : 'rgba(0,123,255,0.9)';
+    const icon = L.divIcon({
+      className: "",
+      html: `<div style="position:relative; width:${ICON_SIZE}px; height:${ICON_SIZE}px;"><div style="position:absolute; left:50%; top:50%; width:${CENTER_SIZE}px; height:${CENTER_SIZE}px; background:${centerColor}; border-radius:50%; transform:translate(-50%,-50%); box-shadow:0 1px 4px rgba(0,0,0,0.3);"></div>${labels}</div>`,
+      iconSize: [ICON_SIZE, ICON_SIZE],
+      iconAnchor: [ICON_SIZE/2, ICON_SIZE/2]
+    });
+    marker.setIcon(icon);
+    marker.setOpacity(1);
+    const [lat, lon] = locKey.split(',').map(Number);
+    marker.bindPopup(`<b>Location</b>: ${lat.toFixed(5)},${lon.toFixed(5)}<br><b>Timestamp</b>: ${ts}<br><b>Total Cells</b>: ${total} ${isRed?'(🔴)':''}<br><b>Counts</b>: ${cellCounts.join(', ')}`, {autoPan:true});
+
+    if (redOnly){
+      if (isRed){ shouldBeInCluster.add(marker); if (!clusterGroup.hasLayer(marker)) clusterGroup.addLayer(marker); }
+      else if (clusterGroup.hasLayer(marker)) clusterGroup.removeLayer(marker);
+    } else {
+      shouldBeInCluster.add(marker);
+      if (!clusterGroup.hasLayer(marker)) clusterGroup.addLayer(marker);
+    }
+  });
+
+  if (forceRecluster){
+    markersByLocation.forEach(marker => {
+      const should = shouldBeInCluster.has(marker);
+      const has = clusterGroup.hasLayer(marker);
+      if (should && !has) clusterGroup.addLayer(marker);
+      else if (!should && has) clusterGroup.removeLayer(marker);
+    });
+  }
+}
+
+// ---------- Drag & Drop (fallback) ----------
+const dropArea = document.getElementById('dropArea');
+dropArea.addEventListener('dragover', e => { e.preventDefault(); dropArea.style.background = 'rgba(0,0,0,0.1)'; });
+dropArea.addEventListener('dragleave', e => { e.preventDefault(); dropArea.style.background = 'rgba(0,0,0,0.05)'; });
+dropArea.addEventListener('drop', e => {
+  e.preventDefault(); dropArea.style.background = 'rgba(0,0,0,0.05)';
+  const file = e.dataTransfer.files[0];
+  if (file && file.name.toLowerCase().endsWith('.csv')){
+    dropArea.classList.add('hidden');
+    document.getElementById('loadingOverlay').classList.remove('hidden');
+    setLoadingText('Reading <b>' + file.name + '</b>…');
+    const reader = new FileReader();
+    reader.onload = () => handleCSV(reader.result);
+    reader.readAsText(file);
+  } else {
+    alert('Please drop a CSV file.');
+  }
+});
+</script>
+</body>
+</html>
